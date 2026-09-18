@@ -17,7 +17,8 @@ This is written so someone else could redo it themselves with nothing more than 
 9. [Tune Windows for low RAM](#9-tune-windows-for-low-ram)
 10. [Populate the directory](#10-populate-the-directory)
 11. [Prove the sync actually works](#11-prove-the-sync-actually-works)
-12. [Glossary](#glossary)
+12. [Back it up automatically](#12-back-it-up-automatically)
+13. [Glossary](#glossary)
 
 ---
 
@@ -365,6 +366,143 @@ An empty `ExportError` plus a present connector-space object means the sync engi
 
 ---
 
+## 12. Back it up automatically
+
+Everything built so far — the users, the groups, the OU layout, the sync configuration — lives on one disk, on one VM. A domain controller is the single copy of the account database; if it's gone, the domain is gone. Taking a snapshot by hand works right up until the day you forget. AWS Backup turns that habit into a policy: a schedule, a retention window, and an audit trail, running whether anyone remembers or not.
+
+### Give the backup service permission to act
+
+AWS Backup is a service, not a person, so it needs its own role. Two AWS-managed policies cover it — one for making backups, one for restoring them:
+
+```bash
+aws iam create-role --role-name AWSBackupDefaultServiceRole \
+  --assume-role-policy-document file://trust.json
+
+aws iam attach-role-policy --role-name AWSBackupDefaultServiceRole \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+
+aws iam attach-role-policy --role-name AWSBackupDefaultServiceRole \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores
+```
+
+Where `trust.json` says "the backup service may assume this role":
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "backup.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
+}
+```
+
+### Create a vault, then a plan
+
+A vault is the container recovery points land in. Giving this server its own named vault — rather than the account's default — means retention and access rules can be set for it later without touching anything else.
+
+```bash
+aws backup create-backup-vault --backup-vault-name <your-vault-name>
+```
+
+The plan is the policy: when to run, how long to keep each copy, and how late a job may still start. Retention is the real decision — seven days covers "someone broke something on Tuesday" without paying to store months of history.
+
+```json
+{
+  "BackupPlanName": "<your-plan-name>",
+  "Rules": [{
+    "RuleName": "daily-midnight-local",
+    "TargetBackupVaultName": "<your-vault-name>",
+    "ScheduleExpression": "cron(0 5 * * ? *)",
+    "ScheduleExpressionTimezone": "America/Chicago",
+    "StartWindowMinutes": 60,
+    "CompletionWindowMinutes": 180,
+    "Lifecycle": { "DeleteAfterDays": 7 }
+  }]
+}
+```
+
+```bash
+aws backup create-backup-plan --backup-plan file://plan.json
+```
+
+> **Set `ScheduleExpressionTimezone` explicitly.** Without it the cron expression is interpreted as UTC, and the job quietly shifts by an hour twice a year when daylight saving starts and ends.
+
+### Tell the plan what to protect
+
+A plan on its own backs up nothing — it needs a *selection* naming the resources it applies to. Pointing at the **instance** rather than the volume captures the machine as a whole, so a restore produces a bootable server instead of a bare disk you'd have to reattach by hand.
+
+```json
+{
+  "SelectionName": "<your-selection-name>",
+  "IamRoleArn": "arn:aws:iam::<your-account-id>:role/AWSBackupDefaultServiceRole",
+  "Resources": [
+    "arn:aws:ec2:<your-region>:<your-account-id>:instance/<your-instance-id>"
+  ]
+}
+```
+
+```bash
+aws backup create-backup-selection --backup-plan-id <your-plan-id> \
+  --backup-selection file://selection.json
+```
+
+### Take one now, as a known-good baseline
+
+The schedule protects you starting tomorrow. A one-off backup taken the moment the build is finished and working is worth keeping longer than the daily rotation — it's the point you'd actually want to return to if a later change goes wrong.
+
+```bash
+aws backup start-backup-job \
+  --backup-vault-name <your-vault-name> \
+  --resource-arn arn:aws:ec2:<your-region>:<your-account-id>:instance/<your-instance-id> \
+  --iam-role-arn arn:aws:iam::<your-account-id>:role/AWSBackupDefaultServiceRole \
+  --lifecycle DeleteAfterDays=30 \
+  --recovery-point-tags Type=baseline-build-complete
+```
+
+```bash
+aws backup describe-backup-job --backup-job-id <your-job-id> \
+  --query '{State:State,Pct:PercentDone,Msg:StatusMessage}'
+```
+
+An EC2 backup registers an AMI first and only then snapshots the disk behind it, so `PercentDone` can legitimately read `0.0` for ten or fifteen minutes on a 65GB volume. Nothing is wrong; it just has nothing to report yet. This one took about 27 minutes end to end.
+
+### The reported size is not the billed size
+
+When the job finished it reported a `BackupSizeInBytes` of 69,793,218,560 — exactly the full 65GiB volume. That's the *logical* size of what was protected, not what you're charged to keep. Snapshots store only blocks that were actually written, and each one after the first stores only what changed. To measure what's really there:
+
+```bash
+SNAP=$(aws ec2 describe-images --image-ids <your-ami-id> \
+  --query 'Images[0].BlockDeviceMappings[0].Ebs.SnapshotId' --output text)
+
+aws ebs list-snapshot-blocks --snapshot-id $SNAP --max-results 10000
+# paginate with NextToken, then: blocks x BlockSize = real stored bytes
+```
+
+On this server that came to **68,184 blocks × 512KiB = 33.3GiB** — about half the figure the job reported, and the number the bill is actually based on.
+
+### What it costs
+
+AWS Backup adds no surcharge for EBS; you pay the ordinary snapshot rate, $0.05 per GB-month in `us-east-1`. Combined with the measured 33.3GiB baseline and roughly 1.5GiB of daily change held for a week, that comes to about **43.8GiB, or $2.19 a month** — against $3.25 if the full 65GB were billed on every copy.
+
+Don't take either number on faith, including this one. Both are one command away, and both change:
+
+```bash
+aws pricing get-products --service-code AmazonEC2 \
+  --filters "Type=TERM_MATCH,Field=productFamily,Value=Storage Snapshot"
+```
+
+### Three things worth knowing before you rely on this
+
+**A stopped VM is the best thing you can snapshot.** Shutting the server down overnight to save money helps here too: a snapshot of a stopped machine has no half-finished writes in it, so the AD database comes back consistent. Snapshotting a *running* domain controller is only crash-consistent — the equivalent of pulling the power cord and hoping. Scheduling the job for a time the VM is already off costs nothing and removes the problem entirely.
+
+**Application-consistent backups need a running VM and a prepared one.** For a domain controller that *is* running at backup time, the correct answer is Windows VSS, which tells AD to flush to disk and hold still for the moment the snapshot is taken. AWS Backup supports it, but only if the `AwsVssComponents` package is installed on the instance first. Turning VSS on without it doesn't silently downgrade — the job can fail outright. Install the components before enabling the option, not after.
+
+**Restoring a DC from a snapshot is a single-server trick.** In a one-controller domain, rolling back to a snapshot is fine. In a real domain with several controllers it causes *USN rollback*: the restored server replays update numbers its peers have already seen, they conclude it's lying, and replication with it stops. Production recovery uses an authoritative or non-authoritative restore through DSRM instead.
+
+---
+
 ## Glossary
 
 | Term | Meaning |
@@ -386,6 +524,13 @@ An empty `ExportError` plus a present connector-space object means the sync engi
 | #EXT# guest | How a personal Microsoft account looks once added to someone else's tenant — external, not native |
 | Connector space | The sync engine's own local staging area — checking it directly answers "did this work?" faster than the portal |
 | Delta sync | A sync cycle that pushes only what changed since the last run |
+| Snapshot | A point-in-time copy of a disk; after the first, each stores only changed blocks |
+| Recovery point | One restorable copy in a backup vault, stamped with when it was taken |
+| Backup vault | The container recovery points live in, and where retention and access rules apply |
+| Retention | How long a backup is kept before automatic deletion — recovery options traded against storage cost |
+| Crash-consistent | A copy taken without quiescing the running software — the equivalent of pulling the power cord |
+| VSS | Volume Shadow Copy Service — the Windows mechanism that briefly quiets applications so a backup captures them intact |
+| USN rollback | What breaks when a DC is restored from a snapshot in a multi-controller domain: it reuses update numbers its peers already recorded, and they stop replicating with it |
 
 ---
 
