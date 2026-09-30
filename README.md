@@ -18,7 +18,8 @@ This is written so someone else could redo it themselves with nothing more than 
 10. [Populate the directory](#10-populate-the-directory)
 11. [Prove the sync actually works](#11-prove-the-sync-actually-works)
 12. [Back it up automatically](#12-back-it-up-automatically)
-13. [Glossary](#glossary)
+13. [Decommission it cleanly](#13-decommission-it-cleanly)
+14. [Glossary](#glossary)
 
 ---
 
@@ -503,6 +504,79 @@ aws pricing get-products --service-code AmazonEC2 \
 
 ---
 
+## 13. Decommission it cleanly
+
+Standing infrastructure up is the part people practice. Taking it down without losing anything you meant to keep — and without leaving orphaned state behind in a system you no longer control — is the part that separates a lab exercise from operational work. This build came down in a deliberate order, and two of the steps are not obvious.
+
+### Save the known-good image *before* deleting anything
+
+The instinct is to delete the backup plan first, because it's the thing that keeps creating stuff. That's backwards, and it quietly destroys the copy you wanted to keep.
+
+> **A recovery point carries its own lifecycle, set when it was created.** Deleting the plan stops *new* backups, but every existing recovery point still expires on the schedule it was born with. The build-complete baseline here was on a 30-day clock with 17 days left — it would have deleted itself weeks after the teardown "finished," long after anyone was still watching.
+
+Extend it explicitly, first:
+
+```bash
+aws backup update-recovery-point-lifecycle \
+  --backup-vault-name <your-vault-name> \
+  --recovery-point-arn "arn:aws:ec2:<your-region>::image/<your-ami-id>" \
+  --lifecycle 'DeleteAfterDays=36500'
+```
+
+An empty `--lifecycle '{}'` is rejected — you have to name a number. 36500 days is a hundred years, which is how you say "never" to an API that insists on a date. Then verify the image and its snapshot are actually healthy before going any further:
+
+```bash
+aws ec2 describe-images --image-ids <your-ami-id> --query 'Images[0].State'
+aws ec2 describe-snapshots --snapshot-ids <your-snapshot-id> --query 'Snapshots[0].State'
+# want: available / completed
+```
+
+### Then unwind in dependency order
+
+Delete the selection before the plan, and both before the instance, so no scheduled job fires into a machine that's mid-termination.
+
+```bash
+aws backup delete-backup-selection --backup-plan-id <plan-id> --selection-id <selection-id>
+aws backup delete-backup-plan --backup-plan-id <plan-id>
+
+# delete the rotation, skip the keeper
+aws backup delete-recovery-point --backup-vault-name <your-vault-name> \
+  --recovery-point-arn <arn>
+```
+
+> **Script the keeper as an exclusion, not as a memory.** When a delete loop runs over a list, hard-code the ARN you're protecting, make the loop skip it by name, and print which one it skipped. A guard you can read in the output is worth more than being careful, because it still works at 2am when you aren't.
+
+### Terminate, then confirm the image outlived the instance
+
+```bash
+aws ec2 terminate-instances --instance-ids <your-instance-id>
+```
+
+The root volume goes with it when `DeleteOnTermination` is true, which is the default. That's fine — a snapshot is an independent copy, not a pointer at the disk it came from, so it survives the volume being destroyed. Confirm rather than assume: the volume should be gone and the image should still read `available`.
+
+### What's worth keeping once the server is gone
+
+Unused IAM roles, key pairs, security groups and an empty vault cost nothing. Deleting them buys no savings and throws away the scaffolding that makes rebuilding a ten-minute job instead of an afternoon. After teardown the bill was entirely snapshot storage:
+
+| Item | Before (8h/day) | After |
+|---|---|---|
+| Compute (t3.large, Windows) | $19.97/mo | $0 |
+| 65GB gp2 root volume | $6.50/mo | $0 |
+| Backup storage | $2.19/mo | $1.66/mo |
+| **Total** | **$28.66/mo** | **$1.66/mo** |
+
+One 33.3GiB image, about twenty dollars a year, and the entire domain can be relaunched from it. That's a reasonable price for not having to rebuild something that took a week to get right.
+
+### The hybrid-identity trap nobody warns you about
+
+> **Destroying the sync server does not release the synced users.** Terminating the domain controller kills Entra Connect Sync with it, but the tenant doesn't notice. Those accounts stay flagged as on-premises-sourced: they can't be edited or deleted in the cloud, and there's no longer a source server to fix them from.
+
+The tenant has to be told separately that directory synchronization is over — *Identity → Hybrid management → Entra Connect* in the admin center, or by setting the organization's on-premises sync flag to false through Microsoft Graph. Propagation is not instant; historically it has taken up to 72 hours before the accounts convert to cloud-only and become editable again.
+
+The clean order is to turn directory sync off **first**, while the source server still exists, and tear down the infrastructure afterward. Done the other way round it still resolves — but you spend three days waiting on a tenant flag instead of thirty seconds setting one.
+
+---
+
 ## Glossary
 
 | Term | Meaning |
@@ -531,6 +605,9 @@ aws pricing get-products --service-code AmazonEC2 \
 | Crash-consistent | A copy taken without quiescing the running software — the equivalent of pulling the power cord |
 | VSS | Volume Shadow Copy Service — the Windows mechanism that briefly quiets applications so a backup captures them intact |
 | USN rollback | What breaks when a DC is restored from a snapshot in a multi-controller domain: it reuses update numbers its peers already recorded, and they stop replicating with it |
+| Decommission | Retiring infrastructure deliberately — preserving what must outlive it, releasing what costs money, clearing state left behind elsewhere |
+| Recovery point lifecycle | The expiry clock attached to a backup when it was created. It keeps running after the plan that made it is deleted — which is how "saved" copies quietly disappear |
+| DeleteOnTermination | The EBS flag deciding whether a volume dies with its instance. On by default for root volumes |
 
 ---
 
